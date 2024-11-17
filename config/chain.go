@@ -2,8 +2,11 @@ package config
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 
 	"github.com/ethereum-optimism/optimism/op-chain-ops/devkeys"
@@ -19,6 +22,7 @@ import (
 )
 
 var (
+	// Varsayılan mnemonic ve hesap sayısı
 	DefaultSecretsConfig = SecretsConfig{
 		Accounts:       10,
 		Mnemonic:       "test test test test test test test test test test test junk",
@@ -26,81 +30,72 @@ var (
 	}
 )
 
+// Fork yapılandırması
 type ForkConfig struct {
 	RPCUrl      string
 	BlockNumber uint64
 }
 
+// Secrets yapılandırması
 type SecretsConfig struct {
 	Accounts       uint64
 	Mnemonic       string
 	DerivationPath accounts.DerivationPath
 }
 
+// L2 zincir yapılandırması
 type L2Config struct {
 	L1ChainID     uint64
 	L1Addresses   *registry.AddressList
 	DependencySet []uint64
 }
 
+// Zincir yapılandırması
 type ChainConfig struct {
-	Name    string
-	Port    uint64
-	ChainID uint64
-
-	GenesisJSON   []byte
-	SecretsConfig SecretsConfig
-
-	// Optional Config
-	ForkConfig *ForkConfig
-
-	// Optional Config (L1 chain if nil)
-	L2Config *L2Config
-
-	// Optional
+	Name              string
+	Port              uint64
+	ChainID           uint64
+	GenesisJSON       []byte
+	SecretsConfig     SecretsConfig
+	ForkConfig        *ForkConfig
+	L2Config          *L2Config
 	StartingTimestamp uint64
-
-	// Optional
-	LogsDirectory string
+	LogsDirectory     string
 }
 
+// Ağ yapılandırması
 type NetworkConfig struct {
-	L1Config ChainConfig
-
-	L2StartingPort uint64
-	L2Configs      []ChainConfig
-
-	// Signaled higher up as a way to generally
-	// check if Interop is enabled
-	InteropEnabled   bool
-	InteropAutoRelay bool
-	InteropDelay     uint64
+	L1Config          ChainConfig
+	L2StartingPort    uint64
+	L2Configs         []ChainConfig
+	InteropEnabled    bool
+	InteropAutoRelay  bool
+	InteropDelay      uint64
 }
 
+// Zincir arayüzü
 type Chain interface {
-	// Properties
 	Endpoint() string
 	LogPath() string
 	Config() *ChainConfig
 	EthClient() *ethclient.Client
-
-	// Additional methods
 	SimulatedLogs(ctx context.Context, tx *types.Transaction) ([]types.Log, error)
 	SetCode(ctx context.Context, result interface{}, address common.Address, code string) error
 	SetStorageAt(ctx context.Context, result interface{}, address common.Address, storageSlot string, storageValue string) error
 	SetBalance(ctx context.Context, result interface{}, address common.Address, value *big.Int) error
 	SetIntervalMining(ctx context.Context, result interface{}, interval int64) error
-
-	// Lifecycle
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
 }
 
-func GetDefaultNetworkConfig(startingTimestamp uint64, logsDirectory string) NetworkConfig {
-	return NetworkConfig{
-		// Enabled by default as it is included in genesis
-		InteropEnabled: true,
+// Varsayılan ağ yapılandırmasını döndürür
+func GetDefaultNetworkConfig(startingTimestamp uint64, logsDirectory string) (NetworkConfig, error) {
+	if startingTimestamp == 0 || logsDirectory == "" {
+		return NetworkConfig{}, errors.New("Geçersiz başlangıç zaman damgası veya log dizini")
+	}
 
+	return NetworkConfig{
+		InteropEnabled: true,
 		L1Config: ChainConfig{
 			Name:              "Local",
 			ChainID:           genesis.GeneratedGenesisDeployment.L1.ChainID,
@@ -137,34 +132,46 @@ func GetDefaultNetworkConfig(startingTimestamp uint64, logsDirectory string) Net
 				LogsDirectory:     logsDirectory,
 			},
 		},
-	}
+	}, nil
 }
 
-// Note: The default secrets config is used everywhere
-func DefaultSecretsConfigAsString() string {
-
-	keys, err := devkeys.NewMnemonicDevKeys(devkeys.TestMnemonic)
+// Varsayılan SecretsConfig'ı JSON olarak döndürür
+func DefaultSecretsConfigAsJSON() (string, error) {
+	keys, err := devkeys.NewMnemonicDevKeys(DefaultSecretsConfig.Mnemonic)
 	if err != nil {
-		panic(err)
+		return "", fmt.Errorf("Mnemonic anahtarlar oluşturulamadı: %w", err)
 	}
 
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "\nAvailable Accounts\n")
-	fmt.Fprintf(&b, "-----------------------\n")
-
-	for i := range DefaultSecretsConfig.Accounts {
+	var accounts []map[string]string
+	for i := uint64(0); i < DefaultSecretsConfig.Accounts; i++ {
 		address, _ := keys.Address(devkeys.UserKey(i))
-		fmt.Fprintf(&b, "(%d): %s\n", i, address.Hex())
-	}
-
-	fmt.Fprintf(&b, "\nPrivate Keys\n")
-	fmt.Fprintf(&b, "-----------------------\n")
-
-	for i := range DefaultSecretsConfig.Accounts {
 		privateKey, _ := keys.Secret(devkeys.UserKey(i))
-		fmt.Fprintf(&b, "(%d): %s\n", i, hexutil.Encode(crypto.FromECDSA(privateKey)))
+		accounts = append(accounts, map[string]string{
+			"Address":    address.Hex(),
+			"PrivateKey": hexutil.Encode(crypto.FromECDSA(privateKey)),
+		})
 	}
 
-	return b.String()
+	jsonData, err := json.MarshalIndent(accounts, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("JSON oluşturulamadı: %w", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// SecretsConfig'ı JSON dosyasından yükler
+func LoadSecretsConfigFromJSON(filePath string) (SecretsConfig, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return SecretsConfig{}, fmt.Errorf("JSON dosyası açılamadı: %w", err)
+	}
+	defer file.Close()
+
+	var config SecretsConfig
+	if err := json.NewDecoder(file).Decode(&config); err != nil {
+		return SecretsConfig{}, fmt.Errorf("JSON parse edilemedi: %w", err)
+	}
+
+	return config, nil
 }
